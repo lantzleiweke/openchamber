@@ -199,6 +199,9 @@ const readInput = (input: ToolInput | undefined): ParsedInput => inputSchema.par
 
 const renderPageFields = z.object({
   html: z.string().optional().catch(undefined),
+  // A page sent by file: the input holds the path, the page is a snapshot the
+  // plugin put in the call's metadata (`openchamberPage`).
+  path: z.string().optional().catch(undefined),
   title: optionalText,
   awaitAnswer: z.boolean().optional().catch(undefined),
 })
@@ -222,6 +225,10 @@ const openChamberResultSchema = z
       ok: z.boolean().optional().catch(undefined),
       answer: pageAnswerSchema.optional().catch(undefined),
     }).optional().catch(undefined),
+    // The page the call showed when it was sent by file, as the file held it
+    // when the call ran. Final results and progress carry it alike, so a
+    // stopped call keeps it too.
+    openchamberPage: z.object({ html: z.string() }).optional().catch(undefined),
   })
   .catch({})
 
@@ -372,25 +379,39 @@ const pageTitleFromHtml = (html: string): string => (
  * accepted the call, so a refused or unfinished call keeps its tool row. A
  * page that waits for the user's answer shows while its call runs, since the
  * call runs until the user answers, and after a call that failed while waiting.
+ *
+ * The HTML is the input's `html`, else the snapshot of a page sent by file
+ * (`metadata.openchamberPage`). A running waiting call sent by file whose
+ * client has no snapshot yet (a reload, or a second client: OpenCode's REST
+ * copy of a running call has no metadata) answers `html: null`; the chat then
+ * fetches the page the server holds for the wait.
  */
 export function renderedPage(
   toolName: ToolName,
   state: ToolState,
-): { html: string; title: string; ask: RenderedPageAsk } | null {
+): { html: string | null; title: string; ask: RenderedPageAsk } | null {
   if (!isRenderTool(toolName)) return null
   const parsed = renderPageInputSchema.parse(state.input ?? {})
-  const html = parsed.parameters?.html ?? parsed.html
-  if (!html?.trim()) return null
+  // A pending call has no metadata yet.
+  const metadata = openChamberResultSchema.parse(("metadata" in state ? state.metadata : undefined) ?? {})
+  const html = parsed.parameters?.html ?? parsed.html ?? metadata.openchamberPage?.html
+  const given = (parsed.parameters?.title ?? parsed.title)?.trim() ?? ""
+  const waits = (parsed.parameters?.awaitAnswer ?? parsed.awaitAnswer) === true
+  if (!html?.trim()) {
+    const path = parsed.parameters?.path ?? parsed.path
+    if (waits && state.status === "running" && path?.trim()) return { html: null, title: given, ask: { kind: "waiting" } }
+    return null
+  }
   // Empty when neither the call nor the page names it; the chat shows its own word then.
-  const title = (parsed.parameters?.title ?? parsed.title)?.trim() || pageTitleFromHtml(html)
+  const title = given || pageTitleFromHtml(html)
   // A page that waited stays in the chat when its call ends without an
   // answer (the user stopped the turn), so the question it asked is still there.
-  if ((parsed.parameters?.awaitAnswer ?? parsed.awaitAnswer) === true) {
+  if (waits) {
     if (state.status === "running") return { html, title, ask: { kind: "waiting" } }
     if (state.status === "error") return { html, title, ask: { kind: "unanswered" } }
   }
   if (state.status !== "completed") return null
-  const result = openChamberResultSchema.parse(state.metadata ?? {}).openchamber
+  const result = metadata.openchamber
   if (result?.ok !== true) return null
   const answer = result.answer
   if (answer?.answered === true) return { html, title, ask: { kind: "answered", summary: answer.summary, data: answer.data } }

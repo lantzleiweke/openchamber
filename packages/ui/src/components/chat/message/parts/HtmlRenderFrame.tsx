@@ -18,7 +18,8 @@ import { useUIStore } from '@/stores/useUIStore';
 import { shareFileFromNativeApp } from '@/lib/nativeFileShare';
 import type { ToolPart } from '@/lib/opencode/model';
 import { renderedPage, type RenderedPageAsk } from '@/lib/opencode/tools';
-import { answerRenderedPage } from '@/lib/renderPageAnswer';
+import { answerRenderedPage, fetchWaitingRenderedPage, type WaitingRenderedPage } from '@/lib/renderPageAnswer';
+import { useGlobalBlockingRequestsStore } from '@/sync/global-blocking-requests';
 import { openExternalUrl } from '@/lib/url';
 import type { ChatQuoteAnchor } from '@/lib/chatQuoteAnchor';
 import { useConfigStore } from '@/stores/useConfigStore';
@@ -373,13 +374,49 @@ function PageSelectionScope({
     );
 }
 
+/**
+ * The page the server holds for a waiting call sent by file, for a client that
+ * has neither the call's input HTML nor its progress (it reloaded, or joined,
+ * mid-wait). Fetched on mount and again when the server announces this call's
+ * wait, which covers a reload between the call starting and its wait starting.
+ * A 404 means nothing waits, so nothing shows: the call is settling and its
+ * stored result will carry the page. Once the wait ends the held page stays,
+ * so it does not vanish before that result arrives. A failed fetch keeps what
+ * is held rather than clearing it.
+ */
+function useWaitingPage(part: ToolPart, enabled: boolean): WaitingRenderedPage | null {
+    const announced = useGlobalBlockingRequestsStore((state) => (
+        state.bySession.get(part.sessionID)?.pages.some((page) => page.id === part.callID) === true
+    ));
+    const [held, setHeld] = React.useState<WaitingRenderedPage | null>(null);
+    const fetched = React.useRef(false);
+    React.useEffect(() => {
+        if (!enabled) return undefined;
+        // The wait ended after a fetch: the stored result takes over.
+        if (!announced && fetched.current) return undefined;
+        fetched.current = true;
+        const controller = new AbortController();
+        fetchWaitingRenderedPage({ sessionId: part.sessionID, callId: part.callID, signal: controller.signal }).then(
+            setHeld,
+            () => undefined,
+        );
+        return () => controller.abort();
+    }, [enabled, announced, part.sessionID, part.callID]);
+    return enabled ? held : null;
+}
+
 /** The page an `openchamber_render` call showed, or nothing for any other part. */
 export function ShownPage({ part }: { part: ToolPart }) {
     // Kept while the call's state is the same object, so the page is not sent
     // its answer state again on every render.
     const { t } = useI18n();
     const page = React.useMemo(() => renderedPage(part.tool, part.state), [part.tool, part.state]);
-    return page ? <HtmlRenderFrame part={part} html={page.html} title={page.title || t('chat.htmlRender.untitled')} ask={page.ask} /> : null;
+    const held = useWaitingPage(part, page !== null && page.html === null);
+    if (!page) return null;
+    const html = page.html ?? held?.html;
+    if (html === undefined) return null;
+    const title = page.title || held?.title || t('chat.htmlRender.untitled');
+    return <HtmlRenderFrame part={part} html={html} title={title} ask={page.ask} />;
 }
 
 interface HtmlRenderFrameProps {

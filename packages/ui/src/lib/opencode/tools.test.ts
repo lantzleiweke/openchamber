@@ -296,4 +296,62 @@ describe("renderedPage", () => {
     // Nothing names it: the chat shows its own word.
     expect(titled("<p>a</p>")).toBe("")
   })
+
+  describe("a page sent by file (path)", () => {
+    const pathInput = { action: "render.page", parameters: { path: "/tmp/page.html" } }
+    const waitingInput = { action: "render.page", parameters: { path: "/tmp/page.html", awaitAnswer: true } }
+    const snapshot = { openchamberPage: { html: "<title>Snap</title><p>a</p>" } }
+
+    test("reads a completed call's page from the snapshot in its metadata", () => {
+      expect(renderedPage("openchamber_render", completed(pathInput, { ...accepted, ...snapshot })))
+        .toEqual({ html: "<title>Snap</title><p>a</p>", title: "Snap", ask: { kind: "show" } })
+      // Beside the action, as the plugin also accepts it.
+      expect(renderedPage("openchamber_render", completed({ action: "render.page", path: "/tmp/page.html" }, { ...accepted, ...snapshot }))?.html)
+        .toBe("<title>Snap</title><p>a</p>")
+    })
+
+    test("prefers the input's html over a snapshot", () => {
+      expect(renderedPage("openchamber_render", completed({ parameters: { html: "<p>input</p>" } }, { ...accepted, ...snapshot }))?.html)
+        .toBe("<p>input</p>")
+    })
+
+    test("takes the title from the call, else from the snapshot", () => {
+      expect(renderedPage("openchamber_render", completed({ parameters: { path: "/tmp/page.html", title: "Given" } }, { ...accepted, ...snapshot }))?.title)
+        .toBe("Given")
+      expect(renderedPage("openchamber_render", completed({ parameters: { path: "/tmp/page.html" } }, { ...accepted, openchamberPage: { html: "<h1>Heading</h1>" } }))?.title)
+        .toBe("Heading")
+    })
+
+    test("shows a stopped waiting call as unanswered, with the snapshot its progress carried", () => {
+      const stopped: ToolState = { status: "error", input: waitingInput, error: "aborted", metadata: snapshot, time: { start: 1, end: 2 } }
+      expect(renderedPage("openchamber_render", stopped))
+        .toEqual({ html: "<title>Snap</title><p>a</p>", title: "Snap", ask: { kind: "unanswered" } })
+    })
+
+    test("uses live progress for a running waiting call", () => {
+      const live: ToolState = { status: "running", input: waitingInput, metadata: { openchamber_render: { action: "render.page" }, ...snapshot }, time: { start: 1 } }
+      expect(renderedPage("openchamber_render", live))
+        .toEqual({ html: "<title>Snap</title><p>a</p>", title: "Snap", ask: { kind: "waiting" } })
+    })
+
+    test("a running waiting call without a snapshot has no html yet, and waits", () => {
+      for (const input of [waitingInput, { action: "render.page", path: "/tmp/page.html", awaitAnswer: true }]) {
+        expect(renderedPage("openchamber_render", running(input))).toEqual({ html: null, title: "", ask: { kind: "waiting" } })
+      }
+      expect(renderedPage("openchamber_render", running({ parameters: { path: "/tmp/page.html", title: "Pick", awaitAnswer: true } })))
+        .toEqual({ html: null, title: "Pick", ask: { kind: "waiting" } })
+    })
+
+    test("leaves a path call without a snapshot to its tool row", () => {
+      expect(renderedPage("openchamber_render", completed(pathInput, accepted))).toBeNull()
+      expect(renderedPage("openchamber_render", running(pathInput))).toBeNull()
+      expect(renderedPage("openchamber_render", { status: "error", input: pathInput, error: "refused", time: { start: 1, end: 2 } })).toBeNull()
+      expect(renderedPage("openchamber_render", { status: "error", input: waitingInput, error: "aborted", time: { start: 1, end: 2 } })).toBeNull()
+      expect(renderedPage("openchamber_render", completed(pathInput, { ...accepted, openchamberPage: { html: "  " } }))).toBeNull()
+    })
+
+    test("does not draw a refused call from a stray snapshot", () => {
+      expect(renderedPage("openchamber_render", completed(pathInput, { openchamber: { ok: false }, ...snapshot }))).toBeNull()
+    })
+  })
 })
