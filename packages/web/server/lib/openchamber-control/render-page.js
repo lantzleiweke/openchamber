@@ -171,7 +171,9 @@ const readPageFile = async (filePath) => {
     if (!HTML_FILE_RE.test(target)) {
       throw new OpenChamberControlError(`${NOT_AN_HTML_FILE}; ${requested} points to ${target}`, 400);
     }
-    handle = await fs.open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    // O_NONBLOCK: opening a FIFO named .html would otherwise wait for a writer
+    // and never reach the regular-file check. It does nothing for a file.
+    handle = await fs.open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     const stat = await handle.stat();
     if (!stat.isFile()) {
       throw new OpenChamberControlError(`${requested} is not a regular file`, 400);
@@ -181,7 +183,15 @@ const readPageFile = async (filePath) => {
     }
     const buffer = Buffer.alloc(stat.size);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    const html = buffer.toString('utf8', 0, bytesRead).replace(/^﻿/, '');
+    const bytes = buffer.subarray(0, bytesRead);
+    // PowerShell 5.1 writes UTF-16 with `>`; read as UTF-8 it is NUL-spaced
+    // garbage that would show as source, and its escaped NULs can push the
+    // page past the callback's body limit.
+    const utf16Bom = bytes.length >= 2 && ((bytes[0] === 0xFF && bytes[1] === 0xFE) || (bytes[0] === 0xFE && bytes[1] === 0xFF));
+    if (utf16Bom || bytes.includes(0)) {
+      throw new OpenChamberControlError('Save the page as UTF-8: this file looks like UTF-16 or holds NUL bytes', 400);
+    }
+    const html = bytes.toString('utf8').replace(/^\uFEFF/, '');
     if (!html.trim()) {
       throw new OpenChamberControlError(`${requested} is empty`, 400);
     }

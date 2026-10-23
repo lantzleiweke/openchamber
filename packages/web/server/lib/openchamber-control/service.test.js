@@ -3,9 +3,13 @@ import { describe, expect, it, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import { createOpenChamberControlService } from './service.js';
 import { OpenChamberControlError } from './error.js';
+
+const execFileAsync = promisify(execFile);
 
 const createService = (overrides = {}) => {
   const client = {
@@ -762,7 +766,7 @@ describe('render.page', () => {
       try {
         await fs.writeFile(file('page.html'), page);
         await fs.writeFile(file('legacy.HTM'), '<p>Old</p>');
-        await fs.writeFile(file('bom.html'), `﻿${page}`);
+        await fs.writeFile(file('bom.html'), `\uFEFF${page}`);
 
         await expect(loadFile(service, file('page.html'))).resolves.toEqual({ html: page });
         await expect(loadFile(service, file('legacy.HTM'))).resolves.toEqual({ html: '<p>Old</p>' });
@@ -804,7 +808,7 @@ describe('render.page', () => {
       try {
         await fs.writeFile(file('notes.txt'), page);
         await fs.writeFile(file('empty.html'), '');
-        await fs.writeFile(file('blank.html'), ' \n﻿  ');
+        await fs.writeFile(file('blank.html'), ' \n\uFEFF  ');
         await fs.mkdir(file('dir.html'));
         await fs.symlink(file('notes.txt'), file('disguised.html'));
         await fs.writeFile(file('huge.html'), Buffer.alloc(600_004, 'a'));
@@ -828,14 +832,42 @@ describe('render.page', () => {
       }
     });
 
-    it('answers 403 for a file the server cannot read', async () => {
+    it('refuses UTF-16 and NUL-filled files, which would show as garbage, with the fix', async () => {
+      const { service } = createService();
+      const { file, cleanup } = await setup();
+      try {
+        await fs.writeFile(file('le.html'), Buffer.from(`\uFEFF${page}`, 'utf16le'));
+        await fs.writeFile(file('be.html'), Buffer.from([0xFE, 0xFF, 0x00, 0x3C]));
+        await fs.writeFile(file('nul.html'), Buffer.concat([Buffer.from('<p>Hi'), Buffer.from([0]), Buffer.from('</p>')]));
+        await fs.writeFile(file('nuls.html'), Buffer.alloc(100_000));
+        for (const name of ['le.html', 'be.html', 'nul.html', 'nuls.html']) {
+          await expect(loadFile(service, file(name)))
+            .rejects.toMatchObject({ statusCode: 400, message: 'Save the page as UTF-8: this file looks like UTF-16 or holds NUL bytes' });
+        }
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it.skipIf(process.platform === 'win32')('refuses a FIFO named .html instead of hanging on it', async () => {
+      const { service } = createService();
+      const { file, cleanup } = await setup();
+      try {
+        await execFileAsync('mkfifo', [file('pipe.html')]);
+        await expect(loadFile(service, file('pipe.html')))
+          .rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining('regular file') });
+      } finally {
+        await cleanup();
+      }
+    });
+
+    // Root reads anything, so the case only exists for other users.
+    it.skipIf(process.getuid?.() === 0)('answers 403 for a file the server cannot read', async () => {
       const { service } = createService();
       const { file, cleanup } = await setup();
       try {
         await fs.writeFile(file('locked.html'), page);
         await fs.chmod(file('locked.html'), 0o000);
-        // Root reads anything, so the case only exists for other users.
-        if (process.getuid?.() === 0) return;
         await expect(loadFile(service, file('locked.html'))).rejects.toMatchObject({ statusCode: 403 });
       } finally {
         await cleanup();
