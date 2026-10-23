@@ -180,12 +180,14 @@ const renderPages = (message) => {
   for (const part of messageContent(message)) {
     if (part?.type !== 'tool' || part.name !== 'openchamber_render') continue;
     const input = part.state?.input;
-    const html = input?.parameters?.html ?? input?.html ?? part.state?.metadata?.openchamberPage?.html;
+    // A blank html beside a path is absent: the snapshot is the page.
+    const html = [input?.parameters?.html, input?.html, part.state?.metadata?.openchamberPage?.html]
+      .find((candidate) => isString(candidate) && candidate.trim());
     // A stored tool item's `id` is its call id: the chat's `callID` is this
     // field (projectToolPart in packages/ui/src/lib/opencode/projection.ts).
     // A call without HTML yet (a running page named by file) is kept as null:
     // the message names the call, and the page is held by the server.
-    pages.set(part.id, isString(html) ? html : null);
+    pages.set(part.id, html ?? null);
   }
   return pages;
 };

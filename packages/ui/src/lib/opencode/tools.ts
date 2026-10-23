@@ -394,7 +394,8 @@ export function renderedPage(
   const parsed = renderPageInputSchema.parse(state.input ?? {})
   // A pending call has no metadata yet.
   const metadata = openChamberResultSchema.parse(("metadata" in state ? state.metadata : undefined) ?? {})
-  const html = parsed.parameters?.html ?? parsed.html ?? metadata.openchamberPage?.html
+  // A blank html beside a path is absent: the snapshot is the page.
+  const html = [parsed.parameters?.html, parsed.html, metadata.openchamberPage?.html].find((candidate) => candidate?.trim())
   const given = (parsed.parameters?.title ?? parsed.title)?.trim() ?? ""
   const waits = (parsed.parameters?.awaitAnswer ?? parsed.awaitAnswer) === true
   if (!html?.trim()) {

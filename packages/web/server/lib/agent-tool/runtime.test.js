@@ -699,6 +699,18 @@ describe('managed agent tool runtime', () => {
       });
     });
 
+    it('loads the file when html beside the path is blank', async () => {
+      for (const html of ['', '  \n', null]) {
+        await withRenderTool(loadThenRender('<p>from file</p>'), async ({ render, sent, context }) => {
+          const result = await render.execute({ action: 'render.page', parameters: { html, path: '/tmp/page.html' } }, context);
+
+          expect(sent.map((payload) => payload.stage)).toEqual(['load', undefined]);
+          expect(sent[1].input).toEqual({ action: 'render.page', html: '<p>from file</p>' });
+          expect(result.metadata.openchamberPage).toEqual({ html: '<p>from file</p>' });
+        });
+      }
+    });
+
     it('keeps the file as it was at call time and out of the content the model reads', async () => {
       const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'openchamber-render-path-'));
       temporaryDirectories.push(directory);

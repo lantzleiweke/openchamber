@@ -58,31 +58,33 @@ other.
   does not keep it: it checks `html` (at most 200,000 characters) and
   `title` (at most 120) and answers `403` while `agentRenderToolEnabled` is
   `false`. A page named by file takes the `load` stage first (`options.stage`,
-  set only by the agent tool's callback): `readPageFile` reads the absolute
-  `.html` or `.htm` path once and returns `{ html }`, and the plugin sends that
-  HTML in the ordinary request, which is checked as above. The load refuses a
-  relative path, `~` and `file://`, another extension (on the name and on the
-  `realpath` target), a missing file (`404`), an unreadable one (`403`), a
-  directory or other non-regular file, a file over 600,003 bytes, a UTF-16 or
-  NUL-holding file, an empty one and one over the character limit, all before
-  the page is accepted. The default stage refuses a `path` it is given: with
-  `html` too, "Send html or path, not both", and without, "This connection
-  cannot load a file; send html" (the CLI route sends no stage). The chat reads
-  such a page from the snapshot in the call's metadata, which the plugin
-  writes (`../agent-tool/DOCUMENTATION.md`); the action itself writes nothing
-  durable. With `awaitAnswer` the action waits in `createPageAnswers`, keyed by
+  set only by the agent tool's callback; the CLI route never sends one):
+  `readPageFile` reads the page once and returns `{ html }`, and the plugin
+  sends that HTML in the ordinary request, which is checked as above. The file
+  opens with `O_NOFOLLOW` and `O_NONBLOCK` (a FIFO named `.html` must not block
+  the read), and the opened handle, which is the one read, must be a regular
+  file. The load refuses a relative path, `~` and `file://`, another extension
+  (on the name and on the `realpath` target), a missing file (`404`), an
+  unreadable one (`403`), a directory or other non-regular file, a file over
+  600,003 bytes, a UTF-16 (BOM) or NUL-holding file, an empty one and one over
+  the character limit, all before the page is accepted. The default stage
+  refuses a `path` it is given, with `html` too ("Send html or path, not
+  both") and without ("This connection cannot load a file; send html"); a
+  blank `html` beside the path counts as absent. The chat reads such a page
+  from the snapshot in the call's metadata (`../agent-tool/DOCUMENTATION.md`);
+  the action writes nothing durable. With `awaitAnswer` the action waits in `createPageAnswers`, keyed by
   session and call id, until `answerPage` resolves it
   (`POST /api/openchamber/render/answer` from the chat: a summary of at most
   500 characters and data of at most 16,000 characters as JSON) or the request
-  is aborted. The waiting entry also holds the page's HTML and title, for
-  `waitingPage` (`GET /api/openchamber/render/page?sessionId&callId`: `200`
-  `{ html, title }`, `404` when nothing waits, `400` without both ids), which
-  a client that reloaded or connected during the wait draws from, since
-  OpenCode's copy of a running call has no metadata and a page named by file is
-  not in its input. The held HTML is a reference to the request's string and
-  goes with the entry. Nothing outlives the call, so a second answer, an answer
-  for a call that ended, an answer after a server restart, and a page lookup
-  after any of these are a `404`, never a silent success.
+  is aborted. The waiting entry also holds the page's HTML (a reference to the
+  request's string) and title for `waitingPage`
+  (`GET /api/openchamber/render/page?sessionId&callId`: `200` `{ html, title }`,
+  `404` when nothing waits, `400` without both ids). A client that reloaded or
+  joined mid-wait draws from it, since OpenCode's copy of a running call has no
+  metadata and a page named by file is not in its input. Nothing outlives the
+  call, so a second answer, an answer for a call that ended, an answer after a
+  server restart, and a page lookup after any of these are a `404`, never a
+  silent success.
   `onPageWaitChange` hears both ends of a wait. The server's wiring
   (`index.js`) lists the page with the session's pending requests
   (`trackWaitingPage` in `../opencode/session-runtime.js`), broadcasts

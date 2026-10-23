@@ -325,7 +325,7 @@ export const createRenderPageAction = ({ isEnabled, pageAnswers }) => async (inp
   // The plugin swaps a path for the html it loaded, so a path that arrives here
   // came from a connection that cannot load files.
   if (isString(input.path) && input.path.trim()) {
-    throw new OpenChamberControlError(html
+    throw new OpenChamberControlError(html.trim()
       ? 'Send html or path, not both'
       : 'This connection cannot load a file; send html', 400);
   }

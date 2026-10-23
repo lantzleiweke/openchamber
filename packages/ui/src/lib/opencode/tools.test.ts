@@ -315,6 +315,15 @@ describe("renderedPage", () => {
         .toBe("<p>input</p>")
     })
 
+    test("treats a blank html beside the path as absent and draws the snapshot", () => {
+      for (const html of ["", "  "]) {
+        expect(renderedPage("openchamber_render", completed({ parameters: { html, path: "/tmp/page.html" } }, { ...accepted, ...snapshot }))?.html)
+          .toBe("<title>Snap</title><p>a</p>")
+        expect(renderedPage("openchamber_render", completed({ action: "render.page", html, path: "/tmp/page.html" }, { ...accepted, ...snapshot }))?.html)
+          .toBe("<title>Snap</title><p>a</p>")
+      }
+    })
+
     test("takes the title from the call, else from the snapshot", () => {
       expect(renderedPage("openchamber_render", completed({ parameters: { path: "/tmp/page.html", title: "Given" } }, { ...accepted, ...snapshot }))?.title)
         .toBe("Given")

@@ -279,6 +279,32 @@ describe('session image assets', () => {
     expect(all.body.results).toEqual([{ source: shotPath, status: 'ready', path: shotPath }]);
   });
 
+  it('authorizes a path page whose stored input holds a blank html', async () => {
+    const fixture = await createFixture({ sources: [] });
+    const shotPath = path.join(fixture.directory, 'chart.png');
+    await fs.writeFile(shotPath, PNG);
+    const message = {
+      id: 'msg_1',
+      type: 'assistant',
+      content: [
+        {
+          type: 'tool',
+          name: 'openchamber_render',
+          id: 'call_1',
+          state: {
+            status: 'completed',
+            input: { html: '', path: '/tmp/report.html' },
+            metadata: { openchamber: { ok: true }, openchamberPage: { html: `<img src="${shotPath}">` } },
+          },
+        },
+      ],
+    };
+    fixture.fetchMock.mockImplementation(async () => new Response(JSON.stringify(message), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    const page = await preparePage(fixture.app, fixture.directory, 'call_1', [shotPath]);
+    expect(page.body.results).toEqual([{ source: shotPath, status: 'ready', path: shotPath }]);
+  });
+
   it('serves a running path page from the page its call holds while it waits', async () => {
     const waitingPage = vi.fn(({ callId }) => {
       if (callId !== 'call_1') throw new Error('not waiting');

@@ -375,7 +375,7 @@ const PAGE_METADATA = String.raw`, ...(page ? { openchamberPage: page } : {})`;
 // html, so everything after the load is the path an inline page takes. The
 // load runs under waitSignal, so a chat message or Stop during it ends the call.
 // A refusal comes back to the model as the result, and no second request goes.
-const PAGE_LOAD = String.raw`          if (typeof args.path === "string" && args.html === undefined) {
+const PAGE_LOAD = String.raw`          if (typeof args.path === "string" && (args.html == null || (typeof args.html === "string" && !args.html.trim()))) {
             const loadResponse = await send({ stage: "load" })
             const loadContent = await loadResponse.text()
             let loaded = null
