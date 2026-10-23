@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
 
-type FetchCall = { path: string; init: Record<string, unknown> | undefined };
+type FetchInit = { method?: string; query?: { sessionId: string; callId: string }; signal?: AbortSignal };
+type FetchCall = { path: string; init: FetchInit | undefined };
+type ServerBody = { html?: string | number; title?: string | number; error?: string } | null;
 
 let calls: FetchCall[] = [];
 let respond: () => Response = () => new Response('{}');
 
 mock.module('@/lib/runtime-fetch', () => ({
-    runtimeFetch: async (path: string, init?: Record<string, unknown>) => {
+    runtimeFetch: async (path: string, init?: FetchInit) => {
         calls.push({ path, init });
         return respond();
     },
@@ -14,7 +16,7 @@ mock.module('@/lib/runtime-fetch', () => ({
 
 const { fetchWaitingRenderedPage } = await import('./renderPageAnswer');
 
-const json = (body: unknown, status = 200) => () => new Response(JSON.stringify(body), { status });
+const json = (body: ServerBody, status = 200) => () => new Response(JSON.stringify(body), { status });
 
 describe('fetchWaitingRenderedPage', () => {
     beforeEach(() => {
