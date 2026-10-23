@@ -229,6 +229,7 @@ const RENDER_PAGE_AWAIT_DESCRIPTION = [
 const RENDER_PARAMETER_PROPERTIES = {
   html: { type: 'string', description: RENDER_PAGE_HTML_DESCRIPTION },
   title: { type: 'string', description: `At most ${RENDER_PAGE_MAX_TITLE_LENGTH} characters; without it the page's <title> or first heading names it` },
+  path: { type: 'string', description: 'Instead of html: the absolute path of an .html or .htm file holding the page, such as one a script wrote. OpenChamber reads it once, when the call runs, under the rules for html, so name images in it by absolute path; to show a changed file, call again.' },
   awaitAnswer: { type: 'boolean', description: RENDER_PAGE_AWAIT_DESCRIPTION },
 };
 
@@ -261,7 +262,7 @@ const NOTIFY_TOOL_DESCRIPTION = "Notify the user outside the chat: when long wor
 
 const RENDER_TOOL_DESCRIPTION = "Draw a finished HTML page inline in the chat, above your reply, or ask the user to choose on one (awaitAnswer). "
   + "The page is part of your reply and sits on the chat's background: leave html, body and the outermost element without a background, add no outer card, border or banner title, and set boxes apart by tone. Style with the theme variables listed under html. "
-  + "Read html before writing a page and awaitAnswer before asking on one.";
+  + "Read html before writing a page and awaitAnswer before asking on one. A page a script writes goes by its file: send path rather than copying it into html.";
 
 // A field means the same thing in every tool that declares it, so one set
 // covers them all.
@@ -358,12 +359,47 @@ const ANSWER_WAIT_RELEASE = String.raw` finally {
           releaseWait()
         }`;
 
+// A page given by file path reaches the chat as a snapshot in the call's
+// metadata, never in the content the model reads. Progress carries it while a
+// page waits, because OpenCode copies the last progress into a stopped call's
+// record, and replaces it on every report, so every report repeats it. The
+// result carries it on both branches, answered and closed in the chat.
+// Declared before `progress`, whose first call runs before the load.
+const PAGE_DECLARATION = String.raw`        let page = null
+`;
+const PAGE_PROGRESS = String.raw`
+          ...(page && args.awaitAnswer === true ? { openchamberPage: page } : {}),`;
+const PAGE_METADATA = String.raw`, ...(page ? { openchamberPage: page } : {})`;
+
+// The server reads and checks the file; the plugin then sends the page as
+// html, so everything after the load is the path an inline page takes. The
+// load runs under waitSignal, so a chat message or Stop during it ends the call.
+// A refusal comes back to the model as the result, and no second request goes.
+const PAGE_LOAD = String.raw`          if (typeof args.path === "string" && args.html === undefined) {
+            const loadResponse = await send({ stage: "load" })
+            const loadContent = await loadResponse.text()
+            let loaded = null
+            try { loaded = JSON.parse(loadContent) } catch {}
+            const loadValid = loaded?.schemaVersion === ${TOOL_SCHEMA_VERSION} && typeof loaded?.ok === "boolean" && typeof loaded?.action === "string"
+            if (loadValid && loaded.ok === true && typeof loaded.data?.html === "string") {
+              page = { html: loaded.data.html }
+              args.html = page.html
+              delete args.path
+              if (args.awaitAnswer === true) await progress()
+            } else {
+              await progress({ ok: false })
+              if (loadValid && loaded.ok === false) return { content: loadContent, metadata: { openchamber: { schemaVersion: ${TOOL_SCHEMA_VERSION}, action: args.action, description: title, ok: false } } }
+              return failure({ schemaVersion: ${TOOL_SCHEMA_VERSION}, ok: false, action: args.action, error: { message: "OpenChamber returned an invalid response", kind: "runtime", status: loadResponse.status } })
+            }
+          }
+`;
+
 const ANSWER_CLOSED_IN_CHAT = String.raw`
           if (chatController.signal.aborted && !context.signal?.aborted) {
             const answer = { answered: false, reason: "chat" }
             const payload = { schemaVersion: ${TOOL_SCHEMA_VERSION}, ok: true, action: args.action, data: { answer, note: ${JSON.stringify(RENDER_PAGE_CLOSED_IN_CHAT_NOTE)} } }
             await progress({ ok: true })
-            return { content: JSON.stringify(payload), metadata: { openchamber: { schemaVersion: ${TOOL_SCHEMA_VERSION}, action: args.action, description: title, ok: true, answer } } }
+            return { content: JSON.stringify(payload), metadata: { openchamber: { schemaVersion: ${TOOL_SCHEMA_VERSION}, action: args.action, description: title, ok: true, answer }${PAGE_METADATA} } }
           }`;
 
 /**
@@ -501,13 +537,13 @@ const createToolEntry = ({ name, description, definitions, parameters, codeMode,
         }
 ${reviveDependsOn}${actionSchema.normalize}${normalizeBooleans}        const actionTitles = ${JSON.stringify(AGENT_TOOL_ACTION_TITLES)}
         const title = Object.hasOwn(actionTitles, args.action) ? actionTitles[args.action] : args.action
-        const progress = (extra) => context.progress({
+${answers ? PAGE_DECLARATION : ''}        const progress = (extra) => context.progress({
           ${name}: {
             schemaVersion: ${TOOL_SCHEMA_VERSION},
             action: args.action,
             description: title,
             ...extra,
-          },
+          },${answers ? PAGE_PROGRESS : ''}
         })
         await progress()
         const endpoint = process.env.OPENCHAMBER_AGENT_TOOL_URL
@@ -523,26 +559,27 @@ ${reviveDependsOn}${actionSchema.normalize}${normalizeBooleans}        const act
           return failure({ schemaVersion: ${TOOL_SCHEMA_VERSION}, ok: false, action: args.action, error: { message: "OpenChamber managed tool connection is unavailable" } })
         }
 ${answers ? ANSWER_WAIT_SETUP : ''}
+        const send = (extra) => fetch(endpoint, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer " + token,
+            "content-type": "application/json",
+          },
+          // OpenCode 2 no longer hands a tool its session directory, so the
+          // session id goes over instead and OpenChamber resolves the
+          // directory on its own side. The signal fires when the session is
+          // aborted, so the OpenChamber side stops the action too.
+          body: JSON.stringify({ input: args, sessionID: context.sessionID, callID: context.id, tool: ${JSON.stringify(name)}, ...extra }),
+          signal: ${answers ? 'waitSignal' : 'context.signal'},${answers ? ANSWER_FETCH_TIMEOUT : ''}
+        })
         try {
-          const response = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-              authorization: "Bearer " + token,
-              "content-type": "application/json",
-            },
-            // OpenCode 2 no longer hands a tool its session directory, so the
-            // session id goes over instead and OpenChamber resolves the
-            // directory on its own side. The signal fires when the session is
-            // aborted, so the OpenChamber side stops the action too.
-            body: JSON.stringify({ input: args, sessionID: context.sessionID, callID: context.id, tool: ${JSON.stringify(name)} }),
-            signal: ${answers ? 'waitSignal' : 'context.signal'},${answers ? ANSWER_FETCH_TIMEOUT : ''}
-          })
+${answers ? PAGE_LOAD : ''}          const response = await send()
           const content = await response.text()
           let result = null
           try { result = JSON.parse(content) } catch {}
           const valid = result?.schemaVersion === ${TOOL_SCHEMA_VERSION} && typeof result?.ok === "boolean" && typeof result?.action === "string"
           await progress({ ok: valid && result.ok === true })
-          if (valid) return { content, metadata: { openchamber: { schemaVersion: ${TOOL_SCHEMA_VERSION}, action: args.action, description: title, ok: result.ok === true${answers ? ANSWER_METADATA : ''} } } }
+          if (valid) return { content, metadata: { openchamber: { schemaVersion: ${TOOL_SCHEMA_VERSION}, action: args.action, description: title, ok: result.ok === true${answers ? ANSWER_METADATA : ''} }${answers ? PAGE_METADATA : ''} } }
           return failure({ schemaVersion: ${TOOL_SCHEMA_VERSION}, ok: false, action: args.action, error: { message: "OpenChamber returned an invalid response", kind: "runtime", status: response.status } })
         } catch (error) {${answers ? ANSWER_CLOSED_IN_CHAT : ''}
           return failure({ schemaVersion: ${TOOL_SCHEMA_VERSION}, ok: false, action: args.action, error: { message: error instanceof Error ? error.message : String(error), kind: "runtime" } })

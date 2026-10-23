@@ -638,11 +638,170 @@ describe('managed agent tool runtime', () => {
     const tool = await loadTools(dataDir, 'render');
 
     expect(Object.keys(tool)).toEqual(['openchamber', 'openchamber_render']);
-    expect(Object.keys(tool.openchamber_render.input.properties.parameters.properties).sort()).toEqual(['awaitAnswer', 'html', 'title']);
+    expect(Object.keys(tool.openchamber_render.input.properties.parameters.properties).sort()).toEqual(['awaitAnswer', 'html', 'path', 'title']);
     expect(Object.keys(tool.openchamber.input.properties.parameters.properties)).not.toContain('html');
     // How to write the page rides on its input, which no client cuts short.
     expect(tool.openchamber_render.input.properties.parameters.properties.html.description).toContain('--chart-1');
     expect(tool.openchamber_render.description).toContain('add no outer card, border or banner title');
+    // A page a script writes goes by its file, not copied into html.
+    expect(tool.openchamber_render.input.properties.parameters.properties.path.description).toContain('absolute path of an .html or .htm file');
+    expect(tool.openchamber_render.description).toContain('send path rather than copying it into html');
+  });
+
+  describe('render.page path', () => {
+    const successEnvelope = (data) => JSON.stringify({ schemaVersion: 1, ok: true, action: 'render.page', data });
+
+    /** Loads the render tool and runs `body` with fetch replaced by `respond`; every request is captured. */
+    const withRenderTool = async (respond, body) => {
+      const { runtime, dataDir } = await createRuntime();
+      const prepared = await prepareManagedEnv(runtime, { includeControl: false, includeWeb: false, includeMemory: false, includeRender: true });
+      const hooks = {};
+      const tools = await loadTools(dataDir, 'render-path', hooks);
+      const sent = [];
+      const originalFetch = globalThis.fetch;
+      const originalUrl = process.env.OPENCHAMBER_AGENT_TOOL_URL;
+      const originalToken = process.env.OPENCHAMBER_AGENT_TOOL_TOKEN;
+      process.env.OPENCHAMBER_AGENT_TOOL_URL = prepared.OPENCHAMBER_AGENT_TOOL_URL;
+      process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = prepared.OPENCHAMBER_AGENT_TOOL_TOKEN;
+      globalThis.fetch = async (_endpoint, init) => {
+        const payload = JSON.parse(init.body);
+        sent.push(payload);
+        return respond(payload, init);
+      };
+      const progress = [];
+      const context = { sessionID: 'ses_1', id: 'call_1', signal: new AbortController().signal, progress: async (value) => { progress.push(value); } };
+      try {
+        return await body({ render: tools.openchamber_render, hooks, sent, progress, context });
+      } finally {
+        globalThis.fetch = originalFetch;
+        if (originalUrl === undefined) delete process.env.OPENCHAMBER_AGENT_TOOL_URL;
+        else process.env.OPENCHAMBER_AGENT_TOOL_URL = originalUrl;
+        if (originalToken === undefined) delete process.env.OPENCHAMBER_AGENT_TOOL_TOKEN;
+        else process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = originalToken;
+      }
+    };
+
+    const loadThenRender = (html, render = {}) => (payload) => new Response(
+      payload.stage === 'load' ? successEnvelope({ html }) : successEnvelope({ shown: true, title: 'Page', note: 'shown', ...render }),
+    );
+
+    it('loads the file first, then shows its html under the same call', async () => {
+      await withRenderTool(loadThenRender('<p>from file</p>'), async ({ render, sent, context }) => {
+        const result = await render.execute({ action: 'render.page', parameters: { path: '/tmp/page.html', title: 'Page' } }, context);
+
+        expect(sent).toHaveLength(2);
+        expect(sent[0]).toMatchObject({ stage: 'load', input: { action: 'render.page', path: '/tmp/page.html', title: 'Page' }, sessionID: 'ses_1', callID: 'call_1', tool: 'openchamber_render' });
+        expect(sent[1]).not.toHaveProperty('stage');
+        expect(sent[1].input).toEqual({ action: 'render.page', html: '<p>from file</p>', title: 'Page' });
+        expect(sent[1].input).not.toHaveProperty('path');
+        expect(result.metadata.openchamberPage).toEqual({ html: '<p>from file</p>' });
+        expect(result.metadata.openchamber).toMatchObject({ ok: true });
+      });
+    });
+
+    it('keeps the file as it was at call time and out of the content the model reads', async () => {
+      const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'openchamber-render-path-'));
+      temporaryDirectories.push(directory);
+      const file = path.join(directory, 'page.html');
+      await fs.writeFile(file, '<p>first</p>');
+      // The server side reads the file when the load request arrives.
+      const respond = async (payload) => {
+        if (payload.stage === 'load') return new Response(successEnvelope({ html: await fs.readFile(payload.input.path, 'utf8') }));
+        return new Response(successEnvelope({ shown: true, title: 'Page', note: 'shown' }));
+      };
+      await withRenderTool(respond, async ({ render, context }) => {
+        const result = await render.execute({ action: 'render.page', parameters: { path: file } }, context);
+        await fs.writeFile(file, '<p>second</p>');
+
+        expect(result.metadata.openchamberPage.html).toBe('<p>first</p>');
+        expect(result.content).not.toContain('first');
+        expect(result.content).not.toContain('second');
+      });
+    });
+
+    it('sends progress with the snapshot only for a page that waits', async () => {
+      await withRenderTool(loadThenRender('<p>snap</p>'), async ({ render, progress, context }) => {
+        await render.execute({ action: 'render.page', parameters: { path: '/tmp/a.html' } }, context);
+        expect(progress.length).toBeGreaterThan(0);
+        for (const entry of progress) expect(entry).not.toHaveProperty('openchamberPage');
+      });
+      await withRenderTool(loadThenRender('<p>snap</p>'), async ({ render, progress, context }) => {
+        await render.execute({ action: 'render.page', parameters: { path: '/tmp/a.html', awaitAnswer: true } }, context);
+        // OpenCode copies the last progress into a stopped call's record and
+        // replaces it on every report, so each report after the load carries it.
+        const afterLoad = progress.slice(progress.findIndex((entry) => entry.openchamberPage));
+        expect(afterLoad.length).toBeGreaterThan(1);
+        for (const entry of afterLoad) expect(entry.openchamberPage).toEqual({ html: '<p>snap</p>' });
+        expect(progress.at(-1)).toHaveProperty('openchamberPage');
+      });
+    });
+
+    it('keeps the snapshot when the user writes in the chat while the page waits', async () => {
+      const respond = (payload, init) => {
+        if (payload.stage === 'load') return new Response(successEnvelope({ html: '<p>kept</p>' }));
+        return new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(new Error('aborted')));
+        });
+      };
+      await withRenderTool(respond, async ({ render, hooks, sent, context }) => {
+        const waiting = render.execute({ action: 'render.page', parameters: { path: '/tmp/a.html', awaitAnswer: true } }, context);
+        await vi.waitFor(() => expect(sent).toHaveLength(2));
+        await hooks.prompt({ sessionID: 'ses_1' });
+        const result = await waiting;
+
+        expect(JSON.parse(result.content)).toMatchObject({ ok: true, data: { answer: { answered: false, reason: 'chat' } } });
+        expect(result.metadata.openchamberPage).toEqual({ html: '<p>kept</p>' });
+      });
+    });
+
+    it('returns a refused load as the result and sends no second request', async () => {
+      const refusal = JSON.stringify({ schemaVersion: 1, ok: false, action: 'render.page', error: { message: 'path must be absolute', kind: 'usage', status: 400 } });
+      await withRenderTool(() => new Response(refusal, { status: 400 }), async ({ render, sent, context }) => {
+        const result = await render.execute({ action: 'render.page', parameters: { path: 'page.html' } }, context);
+
+        expect(sent).toHaveLength(1);
+        expect(sent[0].stage).toBe('load');
+        expect(result.content).toBe(refusal);
+        expect(result.metadata.openchamber).toMatchObject({ ok: false });
+        expect(result.metadata).not.toHaveProperty('openchamberPage');
+      });
+    });
+
+    it('sends html and path together on to the server untouched, which refuses them', async () => {
+      await withRenderTool(() => new Response(successEnvelope({})), async ({ render, sent, context }) => {
+        await render.execute({ action: 'render.page', parameters: { html: '<p>a</p>', path: '/tmp/a.html' } }, context);
+
+        expect(sent).toHaveLength(1);
+        expect(sent[0]).not.toHaveProperty('stage');
+        expect(sent[0].input).toMatchObject({ html: '<p>a</p>', path: '/tmp/a.html' });
+      });
+    });
+
+    it('does not load for an inline page, and gives it no snapshot', async () => {
+      await withRenderTool(() => new Response(successEnvelope({ shown: true, title: 'T', note: 'n' })), async ({ render, sent, context }) => {
+        const result = await render.execute({ action: 'render.page', parameters: { html: '<p>a</p>' } }, context);
+
+        expect(sent).toHaveLength(1);
+        expect(sent[0]).not.toHaveProperty('stage');
+        expect(result.metadata).not.toHaveProperty('openchamberPage');
+      });
+    });
+
+    it('ends a load that a chat message interrupts, as the chat branch with no page yet', async () => {
+      const respond = (_payload, init) => new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(new Error('aborted')));
+      });
+      await withRenderTool(respond, async ({ render, hooks, sent, context }) => {
+        const loading = render.execute({ action: 'render.page', parameters: { path: '/tmp/a.html', awaitAnswer: true } }, context);
+        await vi.waitFor(() => expect(sent).toHaveLength(1));
+        await hooks.prompt({ sessionID: 'ses_1' });
+        const result = await loading;
+
+        expect(sent).toHaveLength(1);
+        expect(JSON.parse(result.content)).toMatchObject({ ok: true, data: { answer: { answered: false, reason: 'chat' } } });
+        expect(result.metadata).not.toHaveProperty('openchamberPage');
+      });
+    });
   });
 
   it('takes away the OpenCode tools the control tool replaces, and only while it is on', async () => {
@@ -734,6 +893,35 @@ describe('managed agent tool runtime', () => {
       expect(fetchSpy.mock.lastCall?.[1]).toMatchObject({ timeout: false });
       await ask('call_shown', false);
       expect(fetchSpy.mock.lastCall?.[1]).not.toHaveProperty('timeout');
+
+      // A page that arrives by file: loaded, shown, and held for the wait.
+      const pageDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'openchamber-render-file-'));
+      temporaryDirectories.push(pageDirectory);
+      const pageFile = path.join(pageDirectory, 'page.html');
+      await fs.writeFile(pageFile, '<title>From file</title><p>Pick</p>');
+      const askFile = (id, awaitAnswer) => tools.openchamber_render.execute(
+        { action: 'render.page', parameters: { path: pageFile, awaitAnswer } },
+        { sessionID: 'ses_caller', id, signal: new AbortController().signal, progress: async () => {} },
+      );
+      const shownFromFile = await askFile('call_file', false);
+      expect(JSON.parse(shownFromFile.content)).toMatchObject({ ok: true, data: { shown: true, title: 'From file' } });
+      expect(shownFromFile.content).not.toContain('<p>Pick</p>');
+      expect(shownFromFile.metadata.openchamberPage).toEqual({ html: '<title>From file</title><p>Pick</p>' });
+
+      const waitingFromFile = askFile('call_file_wait', true);
+      await vi.waitFor(() => expect(service.waitingPage({ sessionId: 'ses_caller', callId: 'call_file_wait' })).toMatchObject({ html: '<title>From file</title><p>Pick</p>' }));
+      await fs.writeFile(pageFile, '<p>changed</p>');
+      service.answerPage({ sessionId: 'ses_caller', callId: 'call_file_wait', summary: 'Done' });
+      const answeredFromFile = await waitingFromFile;
+      expect(answeredFromFile.metadata.openchamberPage).toEqual({ html: '<title>From file</title><p>Pick</p>' });
+
+      const refusedFile = await tools.openchamber_render.execute(
+        { action: 'render.page', parameters: { path: 'relative.html' } },
+        { sessionID: 'ses_caller', id: 'call_refused', signal: new AbortController().signal, progress: async () => {} },
+      );
+      expect(JSON.parse(refusedFile.content)).toMatchObject({ ok: false, error: { kind: 'usage' } });
+      expect(refusedFile.metadata.openchamber).toMatchObject({ ok: false });
+      expect(refusedFile.metadata).not.toHaveProperty('openchamberPage');
 
       const closed = ask('call_2');
       // Lets the call reach the server and start waiting there.
