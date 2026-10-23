@@ -53,16 +53,36 @@ other.
   knowledge Plans list does: in place in the panel on desktop and web, in the
   drawer's plan viewer on mobile. No
   window reached is `503`.
-- `render-page.js` runs `render.page` for the `openchamber_render` agent tool. Only `html` is required: a page sent without a title is named after its own `<title>`, else its first h1 to h3, else "Page", with the same rule the chat uses (`renderedPage` in `packages/ui/src/lib/opencode/tools.ts`). Weaker models sent title and html in separate calls, each refused call costing the whole page again; a missing html now also asks for both in one call.
-  The chat draws the page from the call's own input, so the action stores
-  nothing: it checks `html` (at most 200,000 characters) and `title` (at most
-  120) and answers `403` while `agentRenderToolEnabled` is `false`. With
-  `awaitAnswer` the action waits in `createPageAnswers`, keyed by session and
-  call id, until `answerPage` resolves it (`POST /api/openchamber/render/answer`
-  from the chat: a summary of at most 500 characters and data of at most
-  16,000 characters as JSON) or the request is aborted. Nothing outlives the
-  call, so a second answer, an answer for a call that ended, and an answer
-  after a server restart are a `404`, never a silent success.
+- `render-page.js` runs `render.page` for the `openchamber_render` agent tool. Only the page is required, as `html` or as the `path` of an `.html` file: a page sent without a title is named after its own `<title>`, else its first h1 to h3, else "Page", with the same rule the chat uses (`renderedPage` in `packages/ui/src/lib/opencode/tools.ts`). Weaker models sent title and html in separate calls, each refused call costing the whole page again; a missing page now also asks for both in one call.
+  The chat draws an inline page from the call's own input, so the action
+  does not keep it: it checks `html` (at most 200,000 characters) and
+  `title` (at most 120) and answers `403` while `agentRenderToolEnabled` is
+  `false`. A page named by file takes the `load` stage first (`options.stage`,
+  set only by the agent tool's callback): `readPageFile` reads the absolute
+  `.html` or `.htm` path once and returns `{ html }`, and the plugin sends that
+  HTML in the ordinary request, which is checked as above. The load refuses a
+  relative path, `~` and `file://`, another extension (on the name and on the
+  `realpath` target), a missing file (`404`), an unreadable one (`403`), a
+  directory or other non-regular file, a file over 600,003 bytes, a UTF-16 or
+  NUL-holding file, an empty one and one over the character limit, all before
+  the page is accepted. The default stage refuses a `path` it is given: with
+  `html` too, "Send html or path, not both", and without, "This connection
+  cannot load a file; send html" (the CLI route sends no stage). The chat reads
+  such a page from the snapshot in the call's metadata, which the plugin
+  writes (`../agent-tool/DOCUMENTATION.md`); the action itself writes nothing
+  durable. With `awaitAnswer` the action waits in `createPageAnswers`, keyed by
+  session and call id, until `answerPage` resolves it
+  (`POST /api/openchamber/render/answer` from the chat: a summary of at most
+  500 characters and data of at most 16,000 characters as JSON) or the request
+  is aborted. The waiting entry also holds the page's HTML and title, for
+  `waitingPage` (`GET /api/openchamber/render/page?sessionId&callId`: `200`
+  `{ html, title }`, `404` when nothing waits, `400` without both ids), which
+  a client that reloaded or connected during the wait draws from, since
+  OpenCode's copy of a running call has no metadata and a page named by file is
+  not in its input. The held HTML is a reference to the request's string and
+  goes with the entry. Nothing outlives the call, so a second answer, an answer
+  for a call that ended, an answer after a server restart, and a page lookup
+  after any of these are a `404`, never a silent success.
   `onPageWaitChange` hears both ends of a wait. The server's wiring
   (`index.js`) lists the page with the session's pending requests
   (`trackWaitingPage` in `../opencode/session-runtime.js`), broadcasts
@@ -82,7 +102,8 @@ other.
   as before.
 - `routes.js` is the authenticated CLI HTTP adapter. It forwards one action,
   preserves service status and partial-result details, and propagates request
-  cancellation. It also carries the chat's answer to a waiting page.
+  cancellation. It also carries the chat's answer to a waiting page and serves
+  the page a waiting call holds.
 - `../agent-tool/runtime.js` is the managed-tool adapter. It wraps service
   results in the versioned native-tool envelope and uses a separate ephemeral
   loopback credential.

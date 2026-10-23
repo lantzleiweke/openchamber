@@ -34,11 +34,39 @@ the user can want independently:
   these actions when it is, so a stale plugin cannot keep writing. Writes are
   attributed to the session OpenCode reported, never to a payload field.
 - `openchamber_render` — `render.page`, a self-contained HTML page (`html`,
-  `title`) the chat draws inline above the agent's answer, such as a chart or
-  table. The page travels in the call's input, which OpenCode stores and
-  syncs, so the server keeps no copy: `../openchamber-control/render-page.js`
-  only checks the input (`html` at most 200,000 characters so the callback
-  body stays under its 1 MB limit, `title` at most 120) and the setting.
+  or `path`, `title`) the chat draws inline above the agent's answer, such as
+  a chart or table. A page sent as `html` travels in the call's input, which
+  OpenCode stores and syncs, so the server needs no copy of it.
+  `../openchamber-control/render-page.js` checks the page (`html` at most
+  200,000 characters so the callback body stays under its 1 MB limit, `title`
+  at most 120) and the setting.
+  A page sent as `path`, the absolute path of an `.html` or `.htm` file, goes
+  in two requests (*Why a two-leg load and not one request*). The plugin first
+  sends `stage: "load"`, a top-level field beside `input`, `sessionID`,
+  `callID` and `tool`. The server reads the file once, under the rules in
+  `readPageFile`, and answers `{ html }`. A refusal (relative path, wrong
+  extension, missing file, too large, not UTF-8) is returned to the model as
+  the tool result, and no second request goes. The plugin then drops `path`,
+  puts the HTML in `args.html` and sends the ordinary `render.page` request,
+  so the checks, the title rule, the image notes and the wait are the ones an
+  inline page gets. The input OpenCode stored keeps only the path.
+  The snapshot, `{ html }` as the file held it when the call ran, goes to the
+  chat as the top-level `openchamberPage` key of the call's metadata, beside
+  `openchamber` (*Why the snapshot rides in tool metadata and not a server
+  store*). The result carries it on every branch, answered on the page and
+  closed in the chat alike, and so does each progress report of a page that
+  waits, because OpenCode replaces the progress metadata on every report and
+  copies the last one into a stopped call's record. The content the model
+  reads never holds the HTML. The `stage` field is accepted for `render.page`
+  only (any other is a usage error), and the CLI route never sends one; there,
+  `path` without `html` is refused with "This connection cannot load a file;
+  send html", and `html` together with `path` with "Send html or path, not
+  both".
+  While a page waits, the server holds its HTML and title with the waiting
+  entry until the wait ends. OpenCode's REST copy of a running call has no
+  metadata, so a client that reloaded or connected during the wait reads the
+  page from `GET /api/openchamber/render/page?sessionId&callId`, and the image
+  grant route takes the same lookup for it.
   On by default: enabled while `agentRenderToolEnabled` is not `false`, and the
   control service refuses the action when it is, so a stale plugin cannot
   keep drawing. When to draw is stated only in the line every session carries
@@ -113,6 +141,28 @@ model that fills in the flattened shape, but outside Code Mode the schema
 ships with every request: the copy costs about 8.7k characters per turn when
 all tools are on, and the flattened calls already work through
 `additionalProperties`.
+
+### Why a two-leg load and not one request
+
+A page sent by `path` takes a `stage: "load"` request, then the ordinary
+`render.page` request, rather than one request in which the server reads the
+file. With one request the plugin would hold the HTML only once the server's
+final answer arrived, but two results are built without it: the plugin makes
+the answered-in-chat result itself (a chat message aborts the wait before the
+server replies), and OpenCode records a stopped call from the last progress.
+Neither could carry the page, so those pages would vanish from history. Two
+legs put the HTML in the plugin before anything waits. The plugin does not
+read the file itself either: that would move file reading and its rules into a
+string template, and the server already reads the page's images.
+
+### Why the snapshot rides in tool metadata and not a server store
+
+The page the agent overwrites every turn has to stay as it was shown, so the
+chat cannot read the file again. OpenCode stores a call's metadata durably and
+syncs it to every client, and it follows the session through forks and exports.
+A server-side store would need a retention and cleanup policy, would not
+follow a session out, and VS Code has no route to it. The server holds a page
+only while it waits, for the clients metadata cannot reach yet.
 
 ## Runtime flow
 
@@ -292,6 +342,22 @@ past the 2048-character cut.
   per-request way to skip the environment proxy.
 - Inputs map to a fixed action and parameter allowlist. There is no arbitrary
   CLI, shell, route, or URL forwarding.
+- Only the agent's own call, through the token-bound callback, makes the server
+  read a page file, and only the `load` stage of `render.page` does it. The
+  file may be anywhere the server can read, as the images a page names may be,
+  so it is not held to OpenCode's `external_directory` permission; the agent
+  learns its `<title>` and the paths of missing images from the result. The
+  path is absolute, the name and the `realpath` target both end in `.html` or
+  `.htm`, the file opens with `O_NOFOLLOW` and `O_NONBLOCK` (a FIFO named
+  `.html` must not block the read), the opened handle must be a regular file of
+  at most 600,003 bytes, and the same handle is read. A file with a UTF-16 BOM
+  or a NUL byte is refused. No route reads a file by path for a client: the
+  `GET /api/openchamber/render/page` route serves only HTML already held for a
+  waiting call.
+- The file is read once, when the call runs. Pages never re-read it, so the
+  snapshot is what the file held then, and a script should finish writing (or
+  write and rename) before the call. The images a page names are not part of
+  the snapshot: they are read each time the page draws, as for an inline page.
 - Session/worktree deletion and project-path registration are not exposed.
   OpenCode's own `worktree_remove` stays available to the agent, behind the
   `edit` permission, so the control tool's description says only that this
@@ -319,6 +385,11 @@ Every completed call returns JSON:
 Command and operational failures use the same envelope with `ok: false` and
 an `error` object. OpenCode-level cancellation can still produce a native tool
 error state.
+
+A `render.page` call sent by `path` also returns the snapshot as
+`metadata.openchamberPage` (`{ html }`), outside the envelope: the content the
+model reads stays the envelope with no HTML in it, and a refused load returns
+its `ok: false` envelope as the result with no `openchamberPage`.
 
 ## Runtime parity
 

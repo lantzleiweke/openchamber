@@ -24,7 +24,14 @@ the UI is on a different machine.
 - The local images an `openchamber_render` page in the same message names are
   referenced too (`renderPageImageSources` in
   `../openchamber-control/render-page.js`): the page's HTML is the call's
-  input, which OpenCode stores with the message. The chat reads them as data
+  input, or, for a page the agent named by file, the snapshot in the call's
+  metadata (`metadata.openchamberPage.html`); OpenCode stores both with the
+  message. A call that is still running has neither in the stored message when
+  its page waits for an answer and was named by file, since OpenCode's copy of a
+  running call has no metadata. The message still names the call, so the route
+  asks the server for the page that call holds (`waitingPage`, the same lookup
+  as `GET /api/openchamber/render/page`); a call the server no longer holds is
+  a `404`. The chat reads them as data
   URLs and puts them in the page
   (`packages/ui/src/components/chat/message/parts/renderPageImages.ts`).
 - A request that names the page's tool call (`callId`) gets that page's images
