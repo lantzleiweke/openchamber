@@ -169,19 +169,23 @@ const markdownImageSources = (message) => {
 
 /**
  * The message's openchamber_render pages, by tool call id. The page's HTML is
- * the call's input, which OpenCode stores with the message, so it authorizes
- * its paths the way assistant text does. The input is either the page itself
- * or, for a call made through the action form, its `parameters`.
+ * the call's input, or the snapshot in the call's metadata when the agent named
+ * a file (the input then holds only the path). OpenCode stores both with the
+ * message, so they authorize the page's paths the way assistant text does. The
+ * input is either the page itself or, for a call made through the action form,
+ * its `parameters`.
  */
 const renderPages = (message) => {
   const pages = new Map();
   for (const part of messageContent(message)) {
     if (part?.type !== 'tool' || part.name !== 'openchamber_render') continue;
     const input = part.state?.input;
-    const html = input?.parameters?.html ?? input?.html;
+    const html = input?.parameters?.html ?? input?.html ?? part.state?.metadata?.openchamberPage?.html;
     // A stored tool item's `id` is its call id: the chat's `callID` is this
     // field (projectToolPart in packages/ui/src/lib/opencode/projection.ts).
-    if (isString(html)) pages.set(part.id, html);
+    // A call without HTML yet (a running page named by file) is kept as null:
+    // the message names the call, and the page is held by the server.
+    pages.set(part.id, isString(html) ? html : null);
   }
   return pages;
 };
@@ -189,6 +193,7 @@ const renderPages = (message) => {
 const renderPageSources = (message) => {
   const sources = new Set();
   for (const html of renderPages(message).values()) {
+    if (html === null) continue;
     for (const source of renderPageImageSources(html)) sources.add(source);
   }
   return sources;
@@ -224,7 +229,17 @@ export const registerMarkdownImageGrantRoutes = (app, dependencies) => {
     validateDirectoryPath,
     buildOpenCodeUrl,
     getOpenCodeAuthHeaders,
+    waitingPage,
   } = dependencies;
+
+  // The held page's HTML, or undefined when that call no longer waits.
+  const heldPageHtml = (sessionId, callId) => {
+    try {
+      return waitingPage({ sessionId, callId }).html;
+    } catch {
+      return undefined;
+    }
+  };
 
   app.post(
     '/api/openchamber/sessions/:sessionId/markdown-image-grants',
@@ -269,7 +284,10 @@ export const registerMarkdownImageGrantRoutes = (app, dependencies) => {
         // A page's images are checked together, so the page shows them in its own order up to its weight budget.
         let check;
         if (callId) {
-          const html = renderPages(message).get(callId);
+          // A running call has no metadata in OpenCode's stored copy, so a
+          // page that waits for its answer is read from the server that holds it.
+          const stored = renderPages(message).get(callId);
+          const html = stored === null ? heldPageHtml(sessionId, callId) : stored;
           if (html === undefined) return res.status(404).json({ error: 'Page not found' });
           const { images } = await fitRenderPageImages(html, inspect);
           const checked = new Map(images.map((image) => [image.source, image]));

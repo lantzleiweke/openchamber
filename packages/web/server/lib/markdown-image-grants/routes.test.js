@@ -18,7 +18,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
 
-const createFixture = async ({ sources, markdown } = {}) => {
+const createFixture = async ({ sources, markdown, waitingPage } = {}) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'openchamber-session-assets-'));
   roots.push(root);
   const outsideRoot = path.join(root, 'generated-images');
@@ -56,6 +56,9 @@ const createFixture = async ({ sources, markdown } = {}) => {
       : { ok: false, error: 'Invalid directory' },
     buildOpenCodeUrl: (route) => `http://opencode.test${route}`,
     getOpenCodeAuthHeaders: () => ({ authorization: 'Basic test' }),
+    waitingPage: waitingPage ?? (() => {
+      throw new Error('no page is waiting');
+    }),
   });
   return {
     app,
@@ -242,6 +245,66 @@ describe('session image assets', () => {
       { source: backgroundPath, status: 'ready', path: backgroundPath },
       { source: otherPath, status: 'error' },
     ]);
+  });
+
+  it('authorizes the images of a path page from the snapshot its metadata carries', async () => {
+    const fixture = await createFixture({ sources: [] });
+    const shotPath = path.join(fixture.directory, 'chart.png');
+    const strayPath = path.join(fixture.directory, 'stray.png');
+    await Promise.all([shotPath, strayPath].map((file) => fs.writeFile(file, PNG)));
+    const message = {
+      id: 'msg_1',
+      type: 'assistant',
+      content: [
+        {
+          type: 'tool',
+          name: 'openchamber_render',
+          id: 'call_1',
+          state: {
+            status: 'completed',
+            input: { path: '/tmp/report.html' },
+            metadata: { openchamber: { ok: true }, openchamberPage: { html: `<img src="${shotPath}">` } },
+          },
+        },
+      ],
+    };
+    fixture.fetchMock.mockImplementation(async () => new Response(JSON.stringify(message), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    const page = await preparePage(fixture.app, fixture.directory, 'call_1', [shotPath, strayPath]);
+    expect(page.body.results).toEqual([
+      { source: shotPath, status: 'ready', path: shotPath },
+      { source: strayPath, status: 'error' },
+    ]);
+    const all = await prepare(fixture.app, fixture.directory, [shotPath]);
+    expect(all.body.results).toEqual([{ source: shotPath, status: 'ready', path: shotPath }]);
+  });
+
+  it('serves a running path page from the page its call holds while it waits', async () => {
+    const waitingPage = vi.fn(({ callId }) => {
+      if (callId !== 'call_1') throw new Error('not waiting');
+      return { html: `<img src="${waitingPath}">`, title: 'Pick' };
+    });
+    const fixture = await createFixture({ sources: [], waitingPage });
+    const waitingPath = path.join(fixture.directory, 'waiting.png');
+    await fs.writeFile(waitingPath, PNG);
+    const message = {
+      id: 'msg_1',
+      type: 'assistant',
+      content: [
+        { type: 'tool', name: 'openchamber_render', id: 'call_1', state: { status: 'running', input: { path: '/tmp/ask.html', awaitAnswer: true } } },
+        { type: 'tool', name: 'openchamber_render', id: 'call_2', state: { status: 'running', input: { path: '/tmp/other.html' } } },
+      ],
+    };
+    fixture.fetchMock.mockImplementation(async () => new Response(JSON.stringify(message), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    const page = await preparePage(fixture.app, fixture.directory, 'call_1', [waitingPath]);
+    expect(page.body.results).toEqual([{ source: waitingPath, status: 'ready', path: waitingPath }]);
+    expect(waitingPage).toHaveBeenCalledWith({ sessionId: 'ses_1', callId: 'call_1' });
+
+    await request(fixture.app)
+      .post('/api/openchamber/sessions/ses_1/markdown-image-grants')
+      .send({ directory: fixture.directory, messageId: 'msg_1', callId: 'call_2', sources: [waitingPath] })
+      .expect(404);
   });
 
   it('prepares every image a page or a text names in one request, past twelve', async () => {

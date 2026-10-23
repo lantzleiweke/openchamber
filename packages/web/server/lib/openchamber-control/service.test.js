@@ -727,15 +727,130 @@ describe('render.page', () => {
     expect(await named(page)).toBe('Page');
   });
 
-  it('asks for html and title in one call when html is missing', async () => {
+  it('asks for html or path, with the title, in one call when both are missing', async () => {
     const { service } = createService();
     await expect(service.execute('render.page', { title: 'Coverage' }, '/repo'))
-      .rejects.toMatchObject({ message: expect.stringContaining('Send html and title together in one call') });
+      .rejects.toMatchObject({ message: expect.stringContaining('html or path is required') });
+    await expect(service.execute('render.page', { title: 'Coverage' }, '/repo'))
+      .rejects.toMatchObject({ message: expect.stringContaining('Send it and the title in one call') });
+  });
+
+  it('refuses html together with path in the default stage', async () => {
+    const { service } = createService();
+    await expect(service.execute('render.page', { html: page, path: '/tmp/page.html' }, '/repo'))
+      .rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining('Send html or path, not both') });
+  });
+
+  it('refuses a path that arrives without being loaded, since only the agent tool loads files', async () => {
+    const { service } = createService();
+    await expect(service.execute('render.page', { path: '/tmp/page.html' }, '/repo'))
+      .rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining('cannot load a file') });
+  });
+
+  describe('load stage', () => {
+    const load = { stage: 'load' };
+    const setup = async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'openchamber-render-file-'));
+      const file = (name) => path.join(root, name);
+      return { root, file, cleanup: () => fs.rm(root, { recursive: true, force: true }) };
+    };
+    const loadFile = (service, filePath) => service.execute('render.page', { path: filePath }, '/repo', load);
+
+    it('returns the file as the html to show', async () => {
+      const { service } = createService();
+      const { file, cleanup } = await setup();
+      try {
+        await fs.writeFile(file('page.html'), page);
+        await fs.writeFile(file('legacy.HTM'), '<p>Old</p>');
+        await fs.writeFile(file('bom.html'), `﻿${page}`);
+
+        await expect(loadFile(service, file('page.html'))).resolves.toEqual({ html: page });
+        await expect(loadFile(service, file('legacy.HTM'))).resolves.toEqual({ html: '<p>Old</p>' });
+        await expect(loadFile(service, file('bom.html'))).resolves.toEqual({ html: page });
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('follows a symlink to another html file', async () => {
+      const { service } = createService();
+      const { file, cleanup } = await setup();
+      try {
+        await fs.writeFile(file('real.html'), page);
+        await fs.symlink(file('real.html'), file('link.html'));
+        await expect(loadFile(service, file('link.html'))).resolves.toEqual({ html: page });
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('accepts a file that is exactly the character limit and refuses one past it', async () => {
+      const { service } = createService();
+      const { file, cleanup } = await setup();
+      try {
+        await fs.writeFile(file('limit.html'), 'x'.repeat(200_000));
+        await fs.writeFile(file('over.html'), 'x'.repeat(200_001));
+        await expect(loadFile(service, file('limit.html'))).resolves.toMatchObject({ html: 'x'.repeat(200_000) });
+        await expect(loadFile(service, file('over.html')))
+          .rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining('the limit is 200000') });
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('refuses what is not an absolute path to an html file, each with its reason', async () => {
+      const { service } = createService();
+      const { root, file, cleanup } = await setup();
+      try {
+        await fs.writeFile(file('notes.txt'), page);
+        await fs.writeFile(file('empty.html'), '');
+        await fs.writeFile(file('blank.html'), ' \n﻿  ');
+        await fs.mkdir(file('dir.html'));
+        await fs.symlink(file('notes.txt'), file('disguised.html'));
+        await fs.writeFile(file('huge.html'), Buffer.alloc(600_004, 'a'));
+        const refused = async (filePath, statusCode, reason) => {
+          await expect(loadFile(service, filePath)).rejects.toMatchObject({ statusCode, message: expect.stringContaining(reason) });
+        };
+
+        await refused('page.html', 400, 'absolute');
+        await refused('~/page.html', 400, 'absolute');
+        await refused(`file://${file('page.html')}`, 400, 'absolute');
+        await refused('', 400, 'path is required');
+        await refused(file('notes.txt'), 400, '.html');
+        await refused(file('disguised.html'), 400, '.html');
+        await refused(file('dir.html'), 400, 'regular file');
+        await refused(file('empty.html'), 400, 'empty');
+        await refused(file('blank.html'), 400, 'empty');
+        await refused(file('huge.html'), 400, 'too large');
+        await refused(path.join(root, 'gone.html'), 404, `No file at ${path.join(root, 'gone.html')}`);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('answers 403 for a file the server cannot read', async () => {
+      const { service } = createService();
+      const { file, cleanup } = await setup();
+      try {
+        await fs.writeFile(file('locked.html'), page);
+        await fs.chmod(file('locked.html'), 0o000);
+        // Root reads anything, so the case only exists for other users.
+        if (process.getuid?.() === 0) return;
+        await expect(loadFile(service, file('locked.html'))).rejects.toMatchObject({ statusCode: 403 });
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('refuses while the tool is switched off', async () => {
+      const { service } = createService({ isRenderToolEnabled: async () => false });
+      await expect(loadFile(service, '/tmp/page.html')).rejects.toMatchObject({ statusCode: 403 });
+    });
   });
 
   it.each([
-    [{ title: 'Coverage' }, 'html is required'],
-    [{ html: '   ', title: 'Coverage' }, 'html is required'],
+    [{ title: 'Coverage' }, 'html or path is required'],
+    [{ html: '   ', title: 'Coverage' }, 'html or path is required'],
     [{ html: 'x'.repeat(200_001), title: 'Coverage' }, 'the limit is 200000'],
     [{ html: page, title: 't'.repeat(121) }, 'the limit is 120'],
   ])('refuses %o with a reason the agent can act on', async (input, reason) => {
@@ -823,6 +938,27 @@ describe('render.page', () => {
       expect(() => service.answerPage({ sessionId: 'ses_1', callId: 'call_1', ...answer })).toThrow(expect.objectContaining({ statusCode }));
       service.answerPage({ sessionId: 'ses_1', callId: 'call_1', summary: 'B' });
       await expect(pending).resolves.toMatchObject({ answer: { summary: 'B' } });
+    });
+
+    it('holds the page for a client that connects while it waits, until it is answered or aborted', async () => {
+      const { service } = createService();
+      const controller = new AbortController();
+      expect(() => service.waitingPage({ sessionId: 'ses_1', callId: 'call_1' })).toThrow(expect.objectContaining({ statusCode: 404 }));
+
+      const answered = service.execute('render.page', ask, '/repo', call);
+      await settle();
+      expect(service.waitingPage({ sessionId: 'ses_1', callId: 'call_1' })).toEqual({ html: page, title: 'Pick a layout' });
+      expect(() => service.waitingPage({ sessionId: 'ses_1', callId: 'call_2' })).toThrow(expect.objectContaining({ statusCode: 404 }));
+      service.answerPage({ sessionId: 'ses_1', callId: 'call_1', summary: 'B' });
+      await answered;
+      expect(() => service.waitingPage({ sessionId: 'ses_1', callId: 'call_1' })).toThrow(expect.objectContaining({ statusCode: 404 }));
+
+      const aborted = service.execute('render.page', ask, '/repo', { ...call, signal: controller.signal });
+      await settle();
+      expect(service.waitingPage({ sessionId: 'ses_1', callId: 'call_1' })).toMatchObject({ html: page });
+      controller.abort();
+      await expect(aborted).rejects.toBeTruthy();
+      expect(() => service.waitingPage({ sessionId: 'ses_1', callId: 'call_1' })).toThrow(expect.objectContaining({ statusCode: 404 }));
     });
 
     it('refuses to wait without a call id, so an older plugin falls back to asking in text', async () => {

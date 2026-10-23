@@ -44,4 +44,20 @@ export const registerOpenChamberControlRoutes = (app, { controlService }) => {
       return res.status(controlError.statusCode).json({ error: controlError.message });
     }
   });
+
+  // The page a call holds while it waits, for a client that reloaded or
+  // connected after the call began: OpenCode's stored copy of a running call
+  // carries no metadata, and a page named by file is not in its input.
+  app.get('/api/openchamber/render/page', (req, res) => {
+    try {
+      const { sessionId, callId } = req.query;
+      return res.json(controlService.waitingPage({
+        sessionId: typeof sessionId === 'string' ? sessionId : '',
+        callId: typeof callId === 'string' ? callId : '',
+      }));
+    } catch (error) {
+      const controlError = asControlError(error, 'Could not read the waiting page');
+      return res.status(controlError.statusCode).json({ error: controlError.message });
+    }
+  });
 };

@@ -855,6 +855,26 @@ describe('managed agent tool runtime', () => {
     );
   });
 
+  it('hands the load stage to render.page and refuses every other stage as usage', async () => {
+    const { runtime, executeAction } = await createRuntime();
+    const input = { action: 'render.page', path: '/tmp/page.html' };
+
+    const loaded = await runtime.execute({ input, sessionID: 'ses_1', callID: 'call_1', tool: 'openchamber_render', stage: 'load' });
+    expect(loaded.ok).toBe(true);
+    expect(executeAction).toHaveBeenCalledWith('render.page', input, undefined, { contextSessionId: 'ses_1', contextCallId: 'call_1', stage: 'load' });
+
+    executeAction.mockClear();
+    const refusals = [
+      { input, tool: 'openchamber_render', stage: 'unload' },
+      { input: { action: 'projects.list' }, tool: 'openchamber', stage: 'load' },
+    ];
+    for (const payload of refusals) {
+      const refused = await runtime.execute({ ...payload, sessionID: 'ses_1' });
+      expect(refused).toEqual(expect.objectContaining({ ok: false, error: expect.objectContaining({ kind: 'usage' }) }));
+    }
+    expect(executeAction).not.toHaveBeenCalled();
+  });
+
   it('tells an unresolvable action what the calling tool can do', async () => {
     const { runtime } = await createRuntime();
 

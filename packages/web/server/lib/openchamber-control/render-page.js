@@ -1,15 +1,21 @@
 import fs from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { inspectLocalImage } from '../markdown-image-grants/inspect-image.js';
 import { isString } from '../shared/guards.js';
 import { OpenChamberControlError } from './error.js';
 
-// The page travels in the tool call's input, which OpenCode stores with the
-// message and streams to every client, and through the callback request, whose
-// JSON body is capped at 1 MB. 200,000 characters stays under that cap even for
-// text that encodes to several bytes per character, and is far more than a
-// chart or table page needs.
+// The page travels in the tool call's input or, for a page the agent names by
+// file, in the call's metadata. OpenCode stores both with the message and
+// streams them to every client, and the page crosses the callback request,
+// whose JSON body is capped at 1 MB. 200,000 characters stays under that cap
+// even for text that encodes to several bytes per character, and is far more
+// than a chart or table page needs.
 export const RENDER_PAGE_MAX_HTML_LENGTH = 200_000;
+// What 200,000 characters take as UTF-8 at most (three bytes each), plus a BOM.
+// A file past this cannot hold a page within the limit, so it is refused
+// before it is read.
+const RENDER_PAGE_MAX_FILE_BYTES = RENDER_PAGE_MAX_HTML_LENGTH * 3 + 3;
 export const RENDER_PAGE_MAX_TITLE_LENGTH = 120;
 // An answer is a choice and a few values, never a document: the page sends
 // what the user picked and the agent builds the rest itself.
@@ -127,7 +133,79 @@ const ANSWERED_NOTE = "The user answered on the page. summary is their choice in
  */
 export const RENDER_PAGE_CLOSED_IN_CHAT_NOTE = "The user did not answer on the page and wrote in the chat instead; their message follows this result. Continue from that message and don't ask the same question on a page again unless they want it.";
 
+const htmlTooLong = (length) => new OpenChamberControlError(`html is ${length} characters; the limit is ${RENDER_PAGE_MAX_HTML_LENGTH}. Make the page smaller, for example by drawing data with a script instead of writing out every element`, 400);
+
+const HTML_FILE_RE = /\.html?$/i;
+const NOT_AN_HTML_FILE = 'path must name an .html or .htm file';
+
+/**
+ * The page held by an .html file the agent named, read once when its call runs.
+ * The file may be anywhere the server can read, as the local images a page
+ * names may be, and only the agent's own call reaches this. The name and the
+ * file it resolves to must both be HTML, so a link cannot present another file
+ * as a page, and the handle that is checked is the one that is read.
+ */
+const readPageFile = async (filePath) => {
+  const requested = isString(filePath) ? filePath.trim() : '';
+  if (!requested) {
+    throw new OpenChamberControlError('path is required: the absolute path of an .html or .htm file', 400);
+  }
+  if (!path.isAbsolute(requested)) {
+    throw new OpenChamberControlError(`path must be absolute, such as /tmp/page.html; "${requested}" is not (a relative path, "~" and file:// are not accepted)`, 400);
+  }
+  if (!HTML_FILE_RE.test(requested)) {
+    throw new OpenChamberControlError(NOT_AN_HTML_FILE, 400);
+  }
+  const unreadable = (error) => {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+      return new OpenChamberControlError(`No file at ${requested}`, 404);
+    }
+    if (error?.code === 'EACCES' || error?.code === 'EPERM' || error?.code === 'ELOOP') {
+      return new OpenChamberControlError(`${requested} cannot be read`, 403);
+    }
+    return error;
+  };
+  let handle;
+  try {
+    const target = await fs.realpath(requested);
+    if (!HTML_FILE_RE.test(target)) {
+      throw new OpenChamberControlError(`${NOT_AN_HTML_FILE}; ${requested} points to ${target}`, 400);
+    }
+    handle = await fs.open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const stat = await handle.stat();
+    if (!stat.isFile()) {
+      throw new OpenChamberControlError(`${requested} is not a regular file`, 400);
+    }
+    if (stat.size > RENDER_PAGE_MAX_FILE_BYTES) {
+      throw new OpenChamberControlError(`${requested} is too large: ${stat.size} bytes; a page is at most ${RENDER_PAGE_MAX_HTML_LENGTH} characters`, 400);
+    }
+    const buffer = Buffer.alloc(stat.size);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const html = buffer.toString('utf8', 0, bytesRead).replace(/^﻿/, '');
+    if (!html.trim()) {
+      throw new OpenChamberControlError(`${requested} is empty`, 400);
+    }
+    if (html.length > RENDER_PAGE_MAX_HTML_LENGTH) throw htmlTooLong(html.length);
+    return html;
+  } catch (error) {
+    throw error instanceof OpenChamberControlError ? error : unreadable(error);
+  } finally {
+    await handle?.close();
+  }
+};
+
 const pageKey = (sessionId, callId) => `${sessionId}\u0000${callId}`;
+
+const requirePageIds = (input = {}) => {
+  const sessionId = isString(input.sessionId) ? input.sessionId.trim() : '';
+  const callId = isString(input.callId) ? input.callId.trim() : '';
+  if (!sessionId || !callId) {
+    throw new OpenChamberControlError('sessionId and callId are required', 400);
+  }
+  return { sessionId, callId };
+};
+
+const NOT_WAITING = 'This page is no longer waiting for an answer';
 
 /**
  * Pages that wait for the user's answer, keyed by session and tool call. The
@@ -135,6 +213,11 @@ const pageKey = (sessionId, callId) => `${sessionId}\u0000${callId}`;
  * aborted request (the user stopped the turn, wrote in the chat, or OpenCode
  * went away) drops it. Nothing is kept once a call ends, so a page answers at
  * most once and a stale answer finds nothing to resolve.
+ *
+ * A waiting call also holds its page and title, only until the wait ends. The
+ * stored copy of a running call has no metadata, so a client that reloads or
+ * connects during the wait asks `page` for what to draw (a page named by file
+ * is not in the call's input).
  *
  * `onWaitChange` hears when a page starts and stops waiting, so the server can
  * show the session as waiting for the user the way it does for a form.
@@ -151,7 +234,7 @@ export const createPageAnswers = ({ onWaitChange = () => {} } = {}) => {
     }
   };
 
-  const wait = ({ sessionId, callId, title, directory, signal }) => new Promise((resolve, reject) => {
+  const wait = ({ sessionId, callId, title, html, directory, signal }) => new Promise((resolve, reject) => {
     const key = pageKey(sessionId, callId);
     if (waiting.has(key)) {
       reject(new OpenChamberControlError('This call already shows a page that waits for an answer', 409));
@@ -167,21 +250,28 @@ export const createPageAnswers = ({ onWaitChange = () => {} } = {}) => {
       reject(new OpenChamberControlError('The page stopped waiting before the user answered', 499));
     };
     signal?.addEventListener('abort', onAbort, { once: true });
-    waiting.set(key, (answer) => {
-      waiting.delete(key);
-      signal?.removeEventListener('abort', onAbort);
-      announce({ type: 'settled', sessionId, callId });
-      resolve(answer);
+    waiting.set(key, {
+      html,
+      title,
+      resolve: (answer) => {
+        waiting.delete(key);
+        signal?.removeEventListener('abort', onAbort);
+        announce({ type: 'settled', sessionId, callId });
+        resolve(answer);
+      },
     });
     announce({ type: 'waiting', sessionId, callId, title, directory: directory || null });
   });
 
+  const page = (input) => {
+    const { sessionId, callId } = requirePageIds(input);
+    const held = waiting.get(pageKey(sessionId, callId));
+    if (!held) throw new OpenChamberControlError(NOT_WAITING, 404);
+    return { html: held.html, title: held.title };
+  };
+
   const answer = (input = {}) => {
-    const sessionId = isString(input.sessionId) ? input.sessionId.trim() : '';
-    const callId = isString(input.callId) ? input.callId.trim() : '';
-    if (!sessionId || !callId) {
-      throw new OpenChamberControlError('sessionId and callId are required', 400);
-    }
+    const { sessionId, callId } = requirePageIds(input);
     const summary = isString(input.summary) ? input.summary.trim() : '';
     if (!summary) {
       throw new OpenChamberControlError('summary is required: what the user chose, in a few words', 400);
@@ -194,34 +284,45 @@ export const createPageAnswers = ({ onWaitChange = () => {} } = {}) => {
     if (dataLength > RENDER_PAGE_MAX_ANSWER_DATA_LENGTH) {
       throw new OpenChamberControlError(`data is ${dataLength} characters as JSON; the limit is ${RENDER_PAGE_MAX_ANSWER_DATA_LENGTH}`, 413);
     }
-    const resolve = waiting.get(pageKey(sessionId, callId));
-    if (!resolve) {
-      throw new OpenChamberControlError('This page is no longer waiting for an answer', 404);
+    const held = waiting.get(pageKey(sessionId, callId));
+    if (!held) {
+      throw new OpenChamberControlError(NOT_WAITING, 404);
     }
-    resolve({ answered: true, summary, data });
+    held.resolve({ answered: true, summary, data });
     return { answered: true };
   };
 
-  return { wait, answer };
+  return { wait, answer, page };
 };
 
 /**
- * `render.page`: the chat draws the page straight from the call's input, so
- * this checks that the input is a page the chat will draw and that the tool is
- * still on (a plugin generated before it was switched off must not keep
- * drawing). With `awaitAnswer` the call then waits for the user's answer.
+ * `render.page`: the chat draws the page from the call's input, or from the
+ * call's metadata when the agent named a file, so this checks that the page is
+ * one the chat will draw and that the tool is still on (a plugin generated
+ * before it was switched off must not keep drawing). In the `load` stage it
+ * reads the file the agent named and hands its HTML back for the plugin to
+ * send; the page is then checked like any other. With `awaitAnswer` the call
+ * waits for the user's answer.
  */
-export const createRenderPageAction = ({ isEnabled, pageAnswers }) => async (input, { sessionId, callId, directory, signal } = {}) => {
+export const createRenderPageAction = ({ isEnabled, pageAnswers }) => async (input, { sessionId, callId, directory, signal, stage } = {}) => {
   if (!await isEnabled()) {
     throw new OpenChamberControlError('The render tool is turned off in OpenChamber settings', 403);
   }
+  if (stage === 'load') {
+    return { html: await readPageFile(input.path) };
+  }
   const html = isString(input.html) ? input.html : '';
+  // The plugin swaps a path for the html it loaded, so a path that arrives here
+  // came from a connection that cannot load files.
+  if (isString(input.path) && input.path.trim()) {
+    throw new OpenChamberControlError(html
+      ? 'Send html or path, not both'
+      : 'This connection cannot load a file; send html', 400);
+  }
   if (!html.trim()) {
-    throw new OpenChamberControlError('html is required: one complete, self-contained HTML document. Send html and title together in one call', 400);
+    throw new OpenChamberControlError('html or path is required: one complete, self-contained HTML document, or the absolute path of an .html file holding one. Send it and the title in one call', 400);
   }
-  if (html.length > RENDER_PAGE_MAX_HTML_LENGTH) {
-    throw new OpenChamberControlError(`html is ${html.length} characters; the limit is ${RENDER_PAGE_MAX_HTML_LENGTH}. Make the page smaller, for example by drawing data with a script instead of writing out every element`, 400);
-  }
+  if (html.length > RENDER_PAGE_MAX_HTML_LENGTH) throw htmlTooLong(html.length);
   const title = (isString(input.title) ? input.title.trim() : '')
     || renderPageTitleFromHtml(html)
     || RENDER_PAGE_FALLBACK_TITLE;
@@ -238,7 +339,7 @@ export const createRenderPageAction = ({ isEnabled, pageAnswers }) => async (inp
   if (!sessionId || !callId) {
     throw new OpenChamberControlError('This connection cannot wait for an answer on a page; show the page without awaitAnswer and ask in text', 400);
   }
-  const answer = await pageAnswers.wait({ sessionId, callId, title, directory, signal });
+  const answer = await pageAnswers.wait({ sessionId, callId, title, html, directory, signal });
   return hidden
     ? { title, answer, note: `${ANSWERED_NOTE} ${hidden.note}`, images: hidden.images }
     : { title, answer, note: ANSWERED_NOTE };

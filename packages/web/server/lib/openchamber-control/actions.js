@@ -134,11 +134,12 @@ export const OPENCHAMBER_NOTIFY_ACTIONS = Object.freeze(
 /**
  * Render is its own tool: a page drawn into the chat is a distinct intent from
  * any of the others, and its long layout guidance should cost context only for
- * users who keep it on. The page itself travels in the call's input, which the
- * chat already stores and syncs, so the action only checks it.
+ * users who keep it on. The page itself travels in the call's input, or in its
+ * metadata when the agent names a file, and the chat already stores and syncs
+ * both, so the action only checks it (and reads the file, in the load stage).
  */
 export const OPENCHAMBER_RENDER_ACTION_DEFINITIONS = Object.freeze([
-  { action: 'render.page', title: 'Show a page', description: 'Requires html and title' },
+  { action: 'render.page', title: 'Show a page', description: 'Requires html, or path to an HTML file' },
 ]);
 
 export const OPENCHAMBER_RENDER_ACTIONS = Object.freeze(

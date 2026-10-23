@@ -339,6 +339,7 @@ export const createFeatureRoutesRuntime = (dependencies) => {
       validateDirectoryPath,
       buildOpenCodeUrl,
       getOpenCodeAuthHeaders,
+      waitingPage: (input) => openChamberControlService.waitingPage(input),
     });
 
     registerConfigEntityRoutes(app, {

@@ -843,6 +843,7 @@ export const createOpenChamberControlService = (dependencies) => {
           callId: asNonEmptyString(options.contextCallId),
           directory: asNonEmptyString(contextDirectory),
           signal: options.signal,
+          stage: options.stage,
         });
       }
       if (action === 'file.open') {
@@ -1016,6 +1017,6 @@ export const createOpenChamberControlService = (dependencies) => {
   // (v2 dropped `context.directory` from a tool call), so it sends the session
   // id and the directory is resolved here, where it is authoritative.
   // `answerPage` is the chat's side of a page that waits (render.page with
-  // awaitAnswer).
-  return { execute, resolveSessionDirectory, answerPage: pageAnswers.answer };
+  // awaitAnswer), and `waitingPage` is what a client that joins mid-wait draws.
+  return { execute, resolveSessionDirectory, answerPage: pageAnswers.answer, waitingPage: pageAnswers.page };
 };

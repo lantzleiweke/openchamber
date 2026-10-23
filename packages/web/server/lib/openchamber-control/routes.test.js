@@ -6,9 +6,9 @@ import { BrowserControlError } from '../browser-control/broker.js';
 import { OpenChamberControlError } from './error.js';
 import { registerOpenChamberControlRoutes } from './routes.js';
 
-const createApp = (execute, answerPage = vi.fn()) => {
+const createApp = (execute, answerPage = vi.fn(), waitingPage = vi.fn()) => {
   const app = express();
-  registerOpenChamberControlRoutes(app, { controlService: { execute, answerPage } });
+  registerOpenChamberControlRoutes(app, { controlService: { execute, answerPage, waitingPage } });
   return app;
 };
 
@@ -67,6 +67,28 @@ describe('page answer route', () => {
       .expect(200);
     expect(response.body).toEqual({ answered: true });
     expect(answerPage).toHaveBeenCalledWith(body);
+  });
+
+  it('serves the page a call holds while it waits', async () => {
+    const waitingPage = vi.fn(() => ({ html: '<p>Pick</p>', title: 'Pick' }));
+    const response = await request(createApp(vi.fn(), vi.fn(), waitingPage))
+      .get('/api/openchamber/render/page')
+      .query({ sessionId: 'ses_1', callId: 'call_1' })
+      .expect(200);
+    expect(response.body).toEqual({ html: '<p>Pick</p>', title: 'Pick' });
+    expect(waitingPage).toHaveBeenCalledWith({ sessionId: 'ses_1', callId: 'call_1' });
+  });
+
+  it('answers 404 for a page that is not waiting and 400 without ids', async () => {
+    const waitingPage = vi.fn(({ sessionId, callId }) => {
+      if (!sessionId || !callId) throw new OpenChamberControlError('sessionId and callId are required', 400);
+      throw new OpenChamberControlError('This page is no longer waiting for an answer', 404);
+    });
+    const app = createApp(vi.fn(), vi.fn(), waitingPage);
+
+    const gone = await request(app).get('/api/openchamber/render/page').query({ sessionId: 'ses_1', callId: 'call_1' }).expect(404);
+    expect(gone.body).toEqual({ error: 'This page is no longer waiting for an answer' });
+    await request(app).get('/api/openchamber/render/page').query({ sessionId: 'ses_1' }).expect(400);
   });
 
   it('reports a page that no longer waits as an error, never as success', async () => {

@@ -764,6 +764,12 @@ export const createAgentToolRuntime = (dependencies) => {
     if (usageError) {
       return createResult({ ok: false, action, error: { message: usageError, kind: 'usage' } });
     }
+    // The one stage a plugin may name is the load leg of a page that is a file
+    // (see render.page in ../openchamber-control/render-page.js).
+    const stage = asNonEmptyString(payload.stage);
+    if (stage && !(stage === 'load' && action === 'render.page')) {
+      return createResult({ ok: false, action, error: { message: `Unsupported stage "${stage}" for ${action}`, kind: 'usage' } });
+    }
     if (typeof executeAction !== 'function') {
       return createResult({ ok: false, action, error: { message: 'OpenChamber control service is unavailable', kind: 'runtime' } });
     }
@@ -789,6 +795,7 @@ export const createAgentToolRuntime = (dependencies) => {
       const actionOptions = { ...options };
       if (contextSessionId) actionOptions.contextSessionId = contextSessionId;
       if (contextCallId) actionOptions.contextCallId = contextCallId;
+      if (stage) actionOptions.stage = stage;
       const data = await executeAction(action, { ...payload.input, action }, contextDirectory, actionOptions);
       return createResult({ ok: true, action, data });
     } catch (error) {
